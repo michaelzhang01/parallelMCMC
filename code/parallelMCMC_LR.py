@@ -8,24 +8,17 @@ Parallel MCMC Sampler Test--Logistic Regression
 """
 
 import datetime
-#import itertools
-#import matplotlib.pyplot as plt
 import numpy as np
 import os
 from mpi4py import MPI
 from scipy.io import loadmat
 from scipy.io import savemat
-#import weiszfeld
-#from scipy.interpolate import Rbf
-#from sklearn.metrics.pairwise import rbf_kernel
 from sklearn.mixture import BayesianGaussianMixture
 from scipy import stats
 from sklearn.preprocessing import StandardScaler
-#from scipy.optimize import minimize
-#from scipy.optimize import minimize_scalar
-#import pdb
-#import os
-#from statsmodels.nonparametric.kernel_regression import KernelReg
+from sklearn.metrics.pairwise import rbf_kernel
+from scipy.optimize import minimize
+import pdb
 from llKernelReg import llKernelReg
 
 def log_one_exp(X):
@@ -34,7 +27,7 @@ def log_one_exp(X):
 
     Parameters:
         X: Numpy array.
-    
+
     """
     X = np.array(X)
     Z = np.empty(X.shape)
@@ -46,7 +39,7 @@ def log_one_exp(X):
 
 class parallelMCMC(object):
 
-    def __init__(self,X,Y,theta=None,beta=None,iters=250, iters2=10000, 
+    def __init__(self,X,Y,theta=None,beta=None,iters=10000, iters2=10000,
                  prior_var = 5, prior_mean = 0.):
         """
         Likelihood of data is:
@@ -174,7 +167,8 @@ class parallelMCMC(object):
             self.dp = BayesianGaussianMixture(n_components = 100, max_iter=5000)
             self.dp.fit(self.theta)
 #            self.LL_reg = KernelReg(exog=self.all_theta,endog=self.LL_approx.reshape(-1,1),var_type='c'*self.D)
-            self.LL_reg = llKernelReg(X=self.all_theta,Y =  self.LL_approx.flatten())
+            self.LL_reg = llKernelReg(X=self.all_theta,Y = self.LL_approx.flatten())
+#            self.LL_reg = approx_kern_reg(X=self.all_theta,Y =  self.LL_approx.flatten())
             self.beta_hat_trace = np.empty((self.iters2,self.D))
             self.proposal_beta_hat_trace = np.empty((self.iters2,self.D))
             self.LL_hat_trace = np.empty((self.iters2,1))
@@ -198,7 +192,7 @@ class parallelMCMC(object):
     def local_ess(self,it):
         """
         Local inference method using eliptical slice sampling.
-        
+
         it: Integer, current iteration of MCMC sampler.
         """
         V = np.random.normal(scale = np.sqrt(self.prior_var), size=self.D)
@@ -292,15 +286,23 @@ class parallelMCMC(object):
         return(LL.sum())
 
     def final_MH(self,it):
+        """
+        Performs final MH sampling
+
+        it: Integer, current iteration of MCMC sampler.
+        """
         min_LL = -1e300
         if it == 0:
             self.beta_hat_trace[it] = self.theta_mean_burnin
             self.LL_hat_trace[it] = self.LL_reg.fit(self.beta_hat_trace[it].reshape(1,-1),min_LL)
+#            if np.isnan(self.LL_hat_trace[it]):
+#                pdb.set_trace()
 
         else:
             proposal_theta = self.dp.sample()[0]
             proposal_LL = self.LL_reg.fit(proposal_theta.reshape(1,-1),min_LL)
-            accept_prob = proposal_LL.flatten() - self.LL_hat_trace[it-1]
+            print(proposal_LL)
+            accept_prob = proposal_LL - self.LL_hat_trace[it-1]
             accept_prob += self.dp.score([self.beta_hat_trace[it-1]]) - self.dp.score(proposal_theta)
             accept_prob += stats.multivariate_normal.logpdf(proposal_theta, self.prior_mean*np.ones(self.D), self.prior_var*np.eye(self.D)) - stats.multivariate_normal.logpdf(self.beta_hat_trace[it-1], self.prior_mean*np.ones(self.D), self.prior_var*np.eye(self.D))
 
@@ -318,13 +320,63 @@ class parallelMCMC(object):
 
 
     def predict_LL(self, theta_star, farValue=-1e300):
+        """
+        Predicts log likelihood with local polynomial estimate of LL.
+
+        theta_star: array of float, parameter value to estimate.
+        farValue: float, value that the regressor should have far from the training set.
+        """
         mean = self.LL_reg.fit(theta_star,farValue)
         return(mean)
 
 
+class approx_kern_reg(object):
 
+    def __init__(self, X, Y):
+        self.X = X # theta
+        self.theta_n, self.theta_d = self.X.shape
+        
+        self.LL_approx = Y # LL
+        self.scaler = StandardScaler()
+        self.theta_scale = self.scaler.fit_transform(X)
+        self.h_star = np.exp(minimize(self.local_reg_risk,[0]).x[0])
+
+        
+    def local_reg_risk(self,h):
+        """
+        Objective function to optimize bandwidth parameter for risk estimater of
+        local regression
+        """
+        h = np.exp(h)
+        W = (h/float(self.theta_n))*rbf_kernel(self.theta_scale,gamma=h)
+        risk = np.mean((self.LL_approx - np.dot(W,self.LL_approx))**2)/float(self.theta_n)
+        sigma_hat = np.mean((self.LL_approx[:-1] - self.LL_approx[1:])**2)
+        sigma_hat /= 2.
+        risk -= sigma_hat
+        risk += 2.*sigma_hat*h/float(self.theta_n)
+        return(risk)
+
+    def fit(self, theta_star, h=.0005, farValue=-1e300):
+        theta_star_scale = self.scaler.transform(theta_star)
+        R_i = np.hstack((np.ones((self.theta_n,1)), self.theta_scale-theta_star_scale,(self.theta_scale-theta_star_scale)**2))
+        weighted_dist = rbf_kernel(theta_star_scale.reshape(1,-1), self.theta_scale, gamma=h)
+        if np.sqrt(np.sum(weighted_dist**2)) > 5:
+            return(farValue) 
+        else:
+            W_i = (h/float(self.theta_n))*rbf_kernel(theta_star_scale.reshape(1,-1), self.theta_scale, gamma=h) * np.eye(self.theta_n)
+    #        R_i = np.hstack((np.ones((self.theta_n,1)), self.theta-theta_star,(self.theta-theta_star)**2))
+    #        W_i = h*rbf_kernel(theta_star.reshape(1,-1), self.theta, gamma=h) * np.eye(self.theta_n)
+            RW = np.dot(R_i.T, W_i)
+            RWR_inv = np.linalg.inv( np.dot(RW,R_i))
+            RWLL = np.dot(RW, self.LL_approx)
+            beta_hat = np.dot(RWR_inv, RWLL)
+            if np.isnan(beta_hat[0]):
+                pdb.set_trace()
+            return(beta_hat[0])
+        
 if __name__ == '__main__':
-    synthetic_data = loadmat("../data/skin.mat")
+#    synthetic_data = loadmat("../data/skin.mat")
+    synthetic_data = loadmat("../data/50D_LR.mat")
     N,D = synthetic_data['X'].shape
-    pmc = parallelMCMC(X=synthetic_data['X'],Y=synthetic_data['Y'], theta=None)
+    pmc = parallelMCMC(X=synthetic_data['X'][:,:10],Y=synthetic_data['Y'], theta=None)
     pmc.sample()

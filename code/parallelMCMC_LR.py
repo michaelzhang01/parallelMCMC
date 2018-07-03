@@ -378,5 +378,5 @@ if __name__ == '__main__':
 #    synthetic_data = loadmat("../data/skin.mat")
     synthetic_data = loadmat("../data/50D_LR.mat")
     N,D = synthetic_data['X'].shape
-    pmc = parallelMCMC(X=synthetic_data['X'][:,:10],Y=synthetic_data['Y'], theta=None)
+    pmc = parallelMCMC(X=synthetic_data['X'],Y=synthetic_data['Y'], theta=None)
     pmc.sample()
